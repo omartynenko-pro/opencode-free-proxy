@@ -13,7 +13,24 @@ const PROXY_VERSION = "12";
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
 let apiKeys = {};
 function loadKeys() {
-  try { apiKeys = JSON.parse(fs.readFileSync(keysFile, "utf8")); } catch {}
+  // Priority 1: explicit API_KEY env var
+  const apiKey = process.env.API_KEY;
+  if (apiKey && apiKey.startsWith("oc-")) {
+    apiKeys = { admin: apiKey, "user-default": apiKey };
+    console.log("[INIT] Using API key from environment");
+    return;
+  }
+  // Priority 2: OPENCODE_API_KEY as fallback env var
+  const altKey = process.env.OPENCODE_API_KEY;
+  if (altKey && altKey.startsWith("oc-")) {
+    apiKeys = { admin: altKey, "user-default": altKey };
+    console.log("[INIT] Using API key from environment");
+    return;
+  }
+  // Priority 3: file-based keys (stable across redeploys if file persists)
+  try {
+    apiKeys = JSON.parse(fs.readFileSync(keysFile, "utf8"));
+  } catch {}
   if (Object.keys(apiKeys).length === 0) {
     apiKeys = {
       admin: "oc-" + crypto.randomBytes(20).toString("hex"),
