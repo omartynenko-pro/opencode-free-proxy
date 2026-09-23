@@ -2,3 +2,4 @@ node_modules/
 api-keys.json
 *.log
 .env
+*.env
