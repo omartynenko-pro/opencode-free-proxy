@@ -7,7 +7,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const PROXY_VERSION = "11";
+const PROXY_VERSION = "12";
 
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
@@ -52,11 +52,16 @@ function generateSessionId() {
 }
 
 const MODELS = [
-  "deepseek-v4-flash-free",
   "big-pickle",
-  "minimax-m2.5-free",
-  "nemotron-3-super-free",
-  "qwen3.6-plus-free",
+  "deepseek-v4-flash-free",
+  "mimo-v2.5-free",
+  "mimo-v2.6-flash-free",
+  "ling-3.0-flash-fin-free",
+  "muse-spark-1.2-contributor-free",
+  "muse-spark-1.3-contributor-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+  "jev-1.13-free",
 ];
 
 // Gatekeeper (since 2026-09-19) requires tools named shell/bash and read
@@ -281,6 +286,45 @@ function aggregateZenSSE(zenOpts, body) {
     req.write(body);
     req.end();
   });
+}
+
+// ── Smart fallback across free models ──────────────────────────────
+// Free models are flaky: 403/429 FreeTierError, "Model is unavailable",
+// "not supported". Retry the request with the next free model instead of
+// failing the client.
+function isRetryableUpstream(zenResp) {
+  if (!zenResp) return false;
+  const n = zenResp.status;
+  const errData = zenResp.data?.error || zenResp.data || {};
+  const msg = String(errData.message || errData.type || "").toLowerCase();
+  if (n === 403 || n === 429 || n >= 500) return true;
+  if (/freeusage|freetier|not supported|unavailable|rate limit|free tier|server_error/i.test(msg)) return true;
+  return false;
+}
+
+async function zenSyncWithFallback(model, messages, tools, tool_choice, sessionId) {
+  const candidates = [model, ...MODELS.filter((m) => m !== model)];
+  let last = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const m = candidates[i];
+    const { body, options } = zenRequest(m, messages, false, tools, tool_choice, sessionId);
+    let resp;
+    try {
+      resp = await aggregateZenSSE(options, body);
+    } catch (e) {
+      last = { status: 502, data: { error: { message: e.message } }, raw: "" };
+      continue;
+    }
+    const errBody = resp.data?.error || (resp.data?.type === "error" ? resp.data : null);
+    if (resp.status === 200 && !errBody && resp.data?.choices) {
+      console.log("[FALLBACK OK]", m, "(try " + (i + 1) + ")");
+      return { ok: true, resp, model: m };
+    }
+    last = { status: resp.status, data: resp.data || { error: { message: String(resp.raw || "").slice(0, 200) } }, raw: resp.raw };
+    console.log("[FALLBACK] model:", m, "→ status:", resp.status, "msg:", (errBody?.message || "").slice(0, 140));
+    if (!isRetryableUpstream(resp)) break;
+  }
+  return { ok: false, resp: last, model: null };
 }
 
 // ── Anthropic Messages → OpenAI conversion ─────────────────────────
@@ -584,22 +628,19 @@ app.post("/v1/chat/completions", (req, res) => {
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
   console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
 
-  const { body, options } = zenRequest(model, messages, stream, tools, tool_choice, sessionId);
   if (stream) {
+    const { body, options } = zenRequest(model, messages, true, tools, tool_choice, sessionId);
     pipeZenResponse(options, body, true, res);
   } else {
-    aggregateZenSSE(options, body).then((zenResp) => {
-      const errBody = zenResp.data?.error || (zenResp.data?.type === "error" ? zenResp.data : null);
-      if (zenResp.status !== 200 || errBody) {
-        const errMsg = errBody?.message || zenResp?.data?.message || `Upstream ${zenResp.status}`;
-        const status = errBody ? 429 : (zenResp.status >= 500 ? 502 : 429);
-        console.log("[OAI UPSTREAM ERR]", zenResp.status, errMsg);
+    zenSyncWithFallback(model, messages, tools, tool_choice, sessionId).then(({ ok, resp }) => {
+      if (!ok) {
+        const errBody = resp.data?.error || (resp.data?.type === "error" ? resp.data : null);
+        const errMsg = errBody?.message || `Upstream ${resp.status}`;
+        const status = errBody ? 429 : (resp.status >= 500 ? 502 : 429);
+        console.log("[OAI UPSTREAM ERR]", resp.status, errMsg);
         return res.status(status).json({ error: { message: errMsg, type: "api_error", code: "upstream_error" } });
       }
-      if (!zenResp.data?.choices) {
-        return res.status(502).json({ error: { message: "Invalid upstream response", type: "upstream_error" } });
-      }
-      res.json(zenResp.data);
+      res.json(resp.data);
     }).catch((e) => {
       console.log("[ZEN ERROR]", e.message);
       if (!res.headersSent) res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
@@ -628,28 +669,22 @@ app.post("/v1/messages", async (req, res) => {
 
   console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
 
-  const { body, options } = zenRequest(model, messages, stream, tools, undefined, sessionId);
-
   if (stream) {
+    const { body, options } = zenRequest(model, messages, true, tools, undefined, sessionId);
     pipeZenAsAnthropic(options, body, model, res, inputTokens);
   } else {
     try {
-      const zenResp = await aggregateZenSSE(options, body);
-      const zenErr = zenResp.data?.error || (zenResp.data?.type === "error" ? zenResp.data : null);
-      if (zenResp.status !== 200 || zenErr) {
-        const errMsg = zenErr?.message || zenResp.data?.message || "Rate limit exceeded";
-        const isLimit = (zenResp.status === 403 || zenResp.status === 429);
-        console.log("[ANT UPSTREAM ERR]", zenResp.status, errMsg);
+      const { ok, resp, model: usedModel } = await zenSyncWithFallback(model, messages, tools, undefined, sessionId);
+      if (!ok) {
+        const zenErr = resp.data?.error || (resp.data?.type === "error" ? resp.data : null);
+        const errMsg = zenErr?.message || resp.data?.message || "Rate limit exceeded";
+        const isLimit = (resp.status === 403 || resp.status === 429);
+        console.log("[ANT UPSTREAM ERR]", resp.status, errMsg);
         return res.status(isLimit ? 429 : 502).json({
           type: "error", error: { type: isLimit ? "rate_limit_error" : "upstream_error", message: errMsg },
         });
       }
-      if (!zenResp.data?.choices) {
-        return res.status(502).json({
-          type: "error", error: { type: "upstream_error", message: "Invalid upstream response" },
-        });
-      }
-      res.json(openAIToAnthropic(zenResp.data, model, inputTokens));
+      res.json(openAIToAnthropic(resp.data, usedModel, inputTokens));
     } catch (e) {
       console.log("[ZEN ERROR]", e.message);
       res.status(502).json({ type: "error", error: { type: "upstream_error", message: e.message } });
