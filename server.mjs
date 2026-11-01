@@ -7,7 +7,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const PROXY_VERSION = "12";
+const PROXY_VERSION = "13";
 
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
@@ -68,17 +68,21 @@ function generateSessionId() {
   return session;
 }
 
+// Актуальный список бесплатных chat-моделей OpenCode Zen (сверено с
+// https://opencode.ai/inference/v1/models, 2026-11-01). Удалены снятые с
+// поддержки deepseek-v4-flash-free, mimo-v2.5-free, ling-3.0-flash-fin-free,
+// muse-spark-*-contributor-free, nemotron-3-ultra-free, jev-1.13-free.
+// beam-free регионально ограничен: в части стран отвечает 403 — fallback
+// просто пробует следующую модель.
 const MODELS = [
   "big-pickle",
-  "deepseek-v4-flash-free",
-  "mimo-v2.5-free",
+  "deepseek-v4.1-flash-free",
+  "glm-5.3-flash-free",
   "mimo-v2.6-flash-free",
-  "ling-3.0-flash-fin-free",
-  "muse-spark-1.2-contributor-free",
-  "muse-spark-1.3-contributor-free",
-  "nemotron-3-ultra-free",
   "nemotron-3.5-lightning-free",
-  "jev-1.13-free",
+  "nemotron-3.5-super-vl-free",
+  "flint-40b-free",
+  "beam-free",
 ];
 
 // Gatekeeper (since 2026-09-19) requires tools named shell/bash and read
@@ -309,6 +313,9 @@ function aggregateZenSSE(zenOpts, body) {
 // Free models are flaky: 403/429 FreeTierError, "Model is unavailable",
 // "not supported". Retry the request with the next free model instead of
 // failing the client.
+// Общий бюджет на перебор моделей: не даём одному запросу висеть минутами.
+const FALLBACK_TOTAL_TIMEOUT_MS = 150000;
+
 function isRetryableUpstream(zenResp) {
   if (!zenResp) return false;
   const n = zenResp.status;
@@ -321,15 +328,31 @@ function isRetryableUpstream(zenResp) {
 
 async function zenSyncWithFallback(model, messages, tools, tool_choice, sessionId) {
   const candidates = [model, ...MODELS.filter((m) => m !== model)];
+  const deadline = Date.now() + FALLBACK_TOTAL_TIMEOUT_MS;
   let last = null;
+  // Если все модели упали, клиенту полезнее увидеть исчерпанный лимит (429),
+  // чем региональный 403 последней модели: он не объясняет общую картину.
+  const rank = (r) => (r?.status === 429 ? 4 : r?.status >= 500 ? 3 : r?.status === 403 ? 2 : 1);
+  let best = null;
+  let brokeOnFatal = false;
+  const remember = (r) => {
+    last = r;
+    if (!best || rank(r) > rank(best)) best = r;
+  };
   for (let i = 0; i < candidates.length; i++) {
     const m = candidates[i];
+    const remaining = deadline - Date.now();
+    if (remaining <= 1000) {
+      console.log("[FALLBACK] time budget exhausted after", i, "model(s)");
+      break;
+    }
     const { body, options } = zenRequest(m, messages, false, tools, tool_choice, sessionId);
+    options.timeout = Math.min(options.timeout, remaining);
     let resp;
     try {
       resp = await aggregateZenSSE(options, body);
     } catch (e) {
-      last = { status: 502, data: { error: { message: e.message } }, raw: "" };
+      remember({ status: 502, data: { error: { message: e.message } }, raw: "" });
       continue;
     }
     const errBody = resp.data?.error || (resp.data?.type === "error" ? resp.data : null);
@@ -337,11 +360,14 @@ async function zenSyncWithFallback(model, messages, tools, tool_choice, sessionI
       console.log("[FALLBACK OK]", m, "(try " + (i + 1) + ")");
       return { ok: true, resp, model: m };
     }
-    last = { status: resp.status, data: resp.data || { error: { message: String(resp.raw || "").slice(0, 200) } }, raw: resp.raw };
+    remember({ status: resp.status, data: resp.data || { error: { message: String(resp.raw || "").slice(0, 200) } }, raw: resp.raw });
     console.log("[FALLBACK] model:", m, "→ status:", resp.status, "msg:", (errBody?.message || "").slice(0, 140));
-    if (!isRetryableUpstream(resp)) break;
+    if (!isRetryableUpstream(resp)) {
+      brokeOnFatal = true;
+      break;
+    }
   }
-  return { ok: false, resp: last, model: null };
+  return { ok: false, resp: brokeOnFatal ? last : (best || last), model: null };
 }
 
 // ── Anthropic Messages → OpenAI conversion ─────────────────────────
@@ -653,7 +679,11 @@ app.post("/v1/chat/completions", (req, res) => {
       if (!ok) {
         const errBody = resp.data?.error || (resp.data?.type === "error" ? resp.data : null);
         const errMsg = errBody?.message || `Upstream ${resp.status}`;
-        const status = errBody ? 429 : (resp.status >= 500 ? 502 : 429);
+        // Не выдаём любую ошибку за 429: 403 — это региональное ограничение,
+        // 5xx — проблема апстрима, 429 — исчерпан бесплатный лимит.
+        const status = resp.status === 403 ? 403
+          : resp.status === 429 ? 429
+          : resp.status >= 500 ? 502 : 429;
         console.log("[OAI UPSTREAM ERR]", resp.status, errMsg);
         return res.status(status).json({ error: { message: errMsg, type: "api_error", code: "upstream_error" } });
       }

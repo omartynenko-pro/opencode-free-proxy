@@ -19,13 +19,22 @@ Done. Server is at `http://localhost:6446`. API keys are in `api-keys.json` (aut
 
 | Model | What it is | Reliability |
 |-------|-----------|-------------|
-| `deepseek-v4-flash-free` | DeepSeek V4 Flash | Solid |
-| `big-pickle` | DeepSeek V4 Flash (alias) | Solid |
-| `minimax-m2.5-free` | MiniMax M2.5 | Solid |
-| `nemotron-3-super-free` | NVIDIA Nemotron 3 Super | Hit or miss |
-| `qwen3.6-plus-free` | Qwen 3.6 Plus | Intermittent |
+| `big-pickle` | Big Pickle (default) | Free |
+| `deepseek-v4.1-flash-free` | DeepSeek V4.1 Flash | Free |
+| `glm-5.3-flash-free` | GLM-5.3 Flash | Free |
+| `mimo-v2.6-flash-free` | MiMo V2.6 Flash | Free |
+| `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | Free |
+| `nemotron-3.5-super-vl-free` | NVIDIA Nemotron 3.5 Super VL | Free |
+| `flint-40b-free` | Flint 40B | Free |
+| `beam-free` | Beam 1.0 | Free, region-locked |
 
 All models support streaming, tool calls, and system messages.
+
+> **Free quota.** OpenCode limits free-model usage per IP. If every model
+> returns `429 FreeUsageLimitError`, the free quota for the server's IP is
+> exhausted — wait for the quota window, move the proxy to an IP with a fresh
+> quota, or use a paid OpenCode API key. `beam-free` is additionally blocked
+> in some countries (`403 RegionError`); the fallback then tries the next model.
 
 ## API
 
@@ -36,7 +45,7 @@ curl http://localhost:6446/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "big-pickle",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
@@ -49,7 +58,7 @@ curl http://localhost:6446/v1/messages \
   -H "x-api-key: YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "big-pickle",
     "system": "You are helpful.",
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 1024,
@@ -83,9 +92,9 @@ Add to `~/.config/opencode/opencode.json`:
       "apiKey": "YOUR_KEY",
       "baseURL": "http://localhost:6446/v1",
       "models": {
-        "free/deepseek-v4-flash-free": {
-          "id": "deepseek-v4-flash-free",
-          "name": "free/deepseek-v4-flash-free",
+        "free/big-pickle": {
+          "id": "big-pickle",
+          "name": "free/big-pickle",
           "attachment": true,
           "reasoning": true
         }
@@ -99,7 +108,7 @@ Add to `~/.config/opencode/opencode.json`:
 
 - Base URL: `http://YOUR_HOST:6446/v1`
 - API Key: your key from `api-keys.json`
-- Model: `deepseek-v4-flash-free`
+- Model: `big-pickle`
 
 ### Claude Code (Anthropic format)
 
